@@ -40,17 +40,40 @@ class MAPPOManager:
         return new_lr
 
     def compute_gae(self, rewards, values, dones, next_value):
-        T = len(rewards)
-        advantages = np.zeros(T, dtype=np.float32)
-        last_gae = 0.0
-        for t in reversed(range(T)):
-            next_non_terminal = 1.0 - dones[t]
-            next_val = next_value if t == T - 1 else values[t + 1]
-            delta = rewards[t] + self.gamma * next_val * next_non_terminal - values[t]
-            last_gae = delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae
-            advantages[t] = last_gae
-        returns = advantages + values
-        return advantages, returns
+        """Computes Generalized Advantage Estimation (GAE).
+        
+        Supports:
+        - 2D per-agent rewards: shape (T, N), values shape (T,) -> returns advantages (T, N), returns (T, N)
+        - 1D scalar team rewards: shape (T,), values shape (T,) -> returns advantages (T,), returns (T,)
+        """
+        rewards = np.asarray(rewards, dtype=np.float32)
+        values = np.asarray(values, dtype=np.float32)
+        dones = np.asarray(dones, dtype=np.float32)
+
+        if rewards.ndim == 2:
+            T, N = rewards.shape
+            advantages = np.zeros((T, N), dtype=np.float32)
+            last_gae = np.zeros(N, dtype=np.float32)
+            for t in reversed(range(T)):
+                next_non_terminal = 1.0 - dones[t]
+                next_val = next_value if t == T - 1 else values[t + 1]
+                delta = rewards[t] + self.gamma * next_val * next_non_terminal - values[t]
+                last_gae = delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae
+                advantages[t] = last_gae
+            returns = advantages + values[:, None]
+            return advantages, returns
+        else:
+            T = len(rewards)
+            advantages = np.zeros(T, dtype=np.float32)
+            last_gae = 0.0
+            for t in reversed(range(T)):
+                next_non_terminal = 1.0 - dones[t]
+                next_val = next_value if t == T - 1 else values[t + 1]
+                delta = rewards[t] + self.gamma * next_val * next_non_terminal - values[t]
+                last_gae = delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae
+                advantages[t] = last_gae
+            returns = advantages + values
+            return advantages, returns
 
     def update(self, obs_b, state_b, act_b, logprob_b, val_b, adv_b, ret_b, epochs=10, batch_size=512):
         obs_t = torch.tensor(obs_b, dtype=torch.float32, device=self.device)
@@ -101,6 +124,12 @@ class MAPPOManager:
                 actor_losses.append(actor_loss.item())
                 critic_losses.append(critic_loss.item())
                 entropies.append(entropy.mean().item())
+
+        # Update running observation and state normalizers AFTER PPO optimization
+        # so rollout old_logprobs match the unshifted normalization statistics (AUD-06)
+        with torch.no_grad():
+            self.actor.obs_norm.update(obs_t)
+            self.critic.state_norm.update(state_t)
 
         # Keep CPU mirror in sync after GPU update
         self.sync_cpu_actor()

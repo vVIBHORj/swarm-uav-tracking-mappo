@@ -9,9 +9,19 @@ IR_W, IR_H = 640.0, 512.0
 
 
 def parse_modality_json(json_data, width, height):
-    """Parses normalized centroids, apparent scale (depth proxy), and visibility mask."""
+    """Parses normalized centroids, apparent scale (depth proxy), and visibility mask.
+    
+    NOTE: All coordinates are normalized image-plane quantities ([0, 1]).
+    They represent image-space proxy tracking signals, not metric physical coordinates.
+    """
+    if not isinstance(json_data, dict) or width <= 0 or height <= 0:
+        return np.zeros((0, 2), dtype=np.float32), np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.bool_)
+
     exist_list = json_data.get("exist", [])
     gt_rects = json_data.get("gt_rect", [])
+    if not isinstance(exist_list, (list, tuple)) or not isinstance(gt_rects, (list, tuple)):
+        return np.zeros((0, 2), dtype=np.float32), np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.bool_)
+
     n_frames = min(len(exist_list), len(gt_rects))
 
     centers = np.zeros((n_frames, 2), dtype=np.float32)
@@ -40,7 +50,17 @@ def parse_modality_json(json_data, width, height):
 
 
 def compute_scale_adjusted_velocities(centers, scales, alpha=0.30, max_speed=2.5):
-    """Rejects camera-panning jumps, adjusts by target depth scale, and applies EMA smoothing."""
+    """Rejects camera-panning jumps, adjusts by target depth scale, and applies EMA smoothing.
+    
+    NOTE ON UNITS (AUD-08):
+    The returned velocities are standardized synthetic velocity proxies in dimensionless
+    simulation units (sim_units/s), scaled to nominal cruise speed (0.55 * max_speed)
+    and clipped to [-max_speed, max_speed] sim_units/s. They do NOT represent calibrated
+    physical meters per second, as no metric camera calibration / extrinsics exist in Anti-UAV-RGBT.
+    """
+    if len(centers) <= 1:
+        return np.zeros((0, 2), dtype=np.float32)
+
     raw_deltas = np.diff(centers, axis=0)
     step_scales = scales[1:, None]
 

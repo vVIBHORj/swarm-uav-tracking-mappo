@@ -1,6 +1,7 @@
 # train.py
 import os
 import time
+import random
 import argparse
 import numpy as np
 import torch
@@ -48,8 +49,16 @@ def train_mappo_rgbt(
     eval_interval=10,
     batch_size=512,
     resume=False,
-    lr=3e-4
+    lr=3e-4,
+    seed=42
 ):
+    # Set deterministic random seeds (AUD-05)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
     os.makedirs("checkpoints", exist_ok=True)
     os.makedirs("results", exist_ok=True)
     writer = SummaryWriter("runs/mappo_anti_uav_rgbt")
@@ -105,7 +114,7 @@ def train_mappo_rgbt(
                 best_val_tcr = float(np.max(history_tcr) / 100.0)
             print(f"[RESUME] Resuming from step {start_step:,} | Previous Best Val TCR: {best_val_tcr:.2%}")
 
-    obs_dict, info_dict = train_env.reset()
+    obs_dict, info_dict = train_env.reset(seed=seed)
     global_step = start_step
     target_global_step = start_step + total_timesteps
     rollout_count = 0
@@ -113,13 +122,14 @@ def train_mappo_rgbt(
 
     print(f"[START] Vectorized MAPPO Training on {agent.device} (CPU Rollouts + GPU PPO Updates)")
     print(f"[DIMS]  Local Obs Dim: {train_env.obs_dim} | Centralized State Dim: {train_env.state_dim}")
-    print(f"[CONFIG] Run Steps: {total_timesteps:,} (Target: {target_global_step:,}) | Rollout Steps: {rollout_steps:,} | Batch Size: {batch_size} | LR: {lr}")
+    print(f"[CONFIG] Run Steps: {total_timesteps:,} (Target: {target_global_step:,}) | Rollout Steps: {rollout_steps:,} | Batch Size: {batch_size} | LR: {lr} | Seed: {seed}")
 
     while global_step < target_global_step:
         agent.anneal_lr(global_step - start_step, total_timesteps)
         obs_buf, state_buf, act_buf, logprob_buf = [], [], [], []
         rew_buf, val_buf, done_buf = [], [], []
         tcr_list, col_list, ate_list, overlap_list = [], [], [], []
+        breakdown_accum = {}
 
         # High-speed rollout collection (zero CUDA driver latency)
         for _ in range(rollout_steps):
@@ -141,11 +151,14 @@ def train_mappo_rgbt(
             next_obs_dict, rewards, terms, truncs, next_info_dict = train_env.step(action_dict)
             done = any(terms.values()) or any(truncs.values())
 
+            # Store per-agent rewards: shape (num_drones,) -> (3,) (AUD-01 fix)
+            per_agent_rewards = [float(rewards[a]) for a in train_env.agents]
+
             obs_buf.append(obs_array)
             state_buf.append(np.repeat(global_state[None, :], train_env.num_drones, axis=0))
             act_buf.append(actions_np)
             logprob_buf.append(logprobs_np)
-            rew_buf.append(rewards["drone_0"])
+            rew_buf.append(per_agent_rewards)
             val_buf.append(value_t)
             done_buf.append(float(done))
 
@@ -154,39 +167,41 @@ def train_mappo_rgbt(
             ate_list.append(next_info_dict["drone_0"]["ate"])
             overlap_list.append(next_info_dict["drone_0"]["overlap"])
 
+            # Accumulate reward breakdown metrics (AUD-09)
+            if "reward_breakdown" in next_info_dict["drone_0"]:
+                for k, v in next_info_dict["drone_0"]["reward_breakdown"].items():
+                    if isinstance(v, (int, float)):
+                        breakdown_accum[k] = breakdown_accum.get(k, 0.0) + float(v)
+
             if done:
                 obs_dict, info_dict = train_env.reset()
             else:
                 obs_dict, info_dict = next_obs_dict, next_info_dict
 
-        # Flatten rollout buffers
+        # Flatten rollout buffers: N agents per step
         N = train_env.num_drones
         obs_b = np.array(obs_buf).reshape(-1, train_env.obs_dim)
         state_b = np.array(state_buf).reshape(-1, train_env.state_dim)
-
-        # Update running mean/std ONCE per rollout directly on GPU
-        obs_batch_t = torch.tensor(obs_b, dtype=torch.float32, device=agent.device)
-        state_batch_t = torch.tensor(state_b, dtype=torch.float32, device=agent.device)
-        agent.actor.obs_norm.update(obs_batch_t)
-        agent.critic.state_norm.update(state_batch_t)
-        agent.sync_cpu_actor()
 
         # Compute next-state bootstrap value
         with torch.no_grad():
             next_state_t = torch.from_numpy(info_dict["drone_0"]["state"].astype(np.float32)).unsqueeze(0)
             next_val = agent.critic_cpu(next_state_t, update_norm=False).item()
 
+        # Compute per-agent GAE advantages and returns: rew_buf is (rollout_steps, N)
+        # advs and rets have shape (rollout_steps, N)
         advs, rets = agent.compute_gae(rew_buf, val_buf, done_buf, next_val)
 
-        # GPU PPO update with batch_size
+        # GPU PPO update with per-agent advantage credit assignment (AUD-01 & AUD-06)
+        # Note: running normalizers are updated at the end of agent.update() to eliminate ratio drift!
         update_stats = agent.update(
             obs_b=obs_b,
             state_b=state_b,
             act_b=np.array(act_buf).reshape(-1, 2),
             logprob_b=np.array(logprob_buf).reshape(-1),
             val_b=np.repeat(np.array(val_buf)[:, None], N, axis=1).reshape(-1),
-            adv_b=np.repeat(advs[:, None], N, axis=1).reshape(-1),
-            ret_b=np.repeat(rets[:, None], N, axis=1).reshape(-1),
+            adv_b=advs.reshape(-1),
+            ret_b=rets.reshape(-1),
             epochs=10,
             batch_size=batch_size
         )
@@ -212,6 +227,11 @@ def train_mappo_rgbt(
         writer.add_scalar("Train/Critic_Loss", update_stats["critic_loss"], global_step)
         writer.add_scalar("Train/Entropy", update_stats["entropy"], global_step)
 
+        # Log decomposed reward components (AUD-09)
+        if breakdown_accum:
+            for k, total_val in breakdown_accum.items():
+                writer.add_scalar(f"Reward/{k}", total_val / rollout_steps, global_step)
+
         history_steps.append(global_step)
         history_rew.append(mean_rew)
         history_tcr.append(mean_tcr * 100.0)
@@ -229,7 +249,7 @@ def train_mappo_rgbt(
 
             print(
                 f"Step: {global_step:7d}/{target_global_step:,} | FPS: {fps:4d} | Train TCR: {mean_tcr:6.2%} | "
-                f"Val TCR: {val_tcr:6.2%} | Val Overlap: {val_overlap:.2f} | Val Col: {val_col:.3f} | Val ATE: {val_ate:.1f}m"
+                f"Val TCR: {val_tcr:6.2%} | Val Overlap: {val_overlap:.2f} | Val Col: {val_col:.3f} | Val ATE: {val_ate:.1f} sim_units"
             )
 
             # Save latest checkpoints
@@ -261,7 +281,7 @@ def train_mappo_rgbt(
     fig, axes = plt.subplots(1, 3, figsize=(16, 4.5), dpi=200)
 
     axes[0].plot(history_steps, history_rew, color="#2563eb", lw=1.8)
-    axes[0].set_title("Shared Team Reward", fontsize=12, fontweight="bold")
+    axes[0].set_title("Team / Agent Mean Reward", fontsize=12, fontweight="bold")
     axes[0].set_xlabel("Timesteps", fontsize=10)
     axes[0].set_ylabel("Reward", fontsize=10)
     axes[0].grid(True, linestyle="--", alpha=0.5)
@@ -294,6 +314,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=512, help="PPO minibatch size")
     parser.add_argument("--resume", action="store_true", help="Resume from best checkpoint and append history")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     args = parser.parse_args()
 
     train_mappo_rgbt(
@@ -302,5 +323,6 @@ if __name__ == "__main__":
         eval_interval=args.eval_interval,
         batch_size=args.batch_size,
         resume=args.resume,
-        lr=args.lr
+        lr=args.lr,
+        seed=args.seed
     )

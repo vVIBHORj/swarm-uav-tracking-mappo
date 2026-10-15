@@ -21,6 +21,7 @@ data/
 checkpoints/
 results/
 runs/
+backups/
 *.pth
 *.onnx
 

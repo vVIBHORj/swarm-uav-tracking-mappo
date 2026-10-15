@@ -64,10 +64,13 @@ class SharedActor(nn.Module):
         std = torch.exp(torch.clamp(self.actor_logstd, -2.0, 0.5)).expand_as(mean)
         dist = Normal(mean, std)
         if action is None:
-            action = dist.sample()
+            raw_action = dist.sample()
+            action = torch.clamp(raw_action, -1.0, 1.0)
+        else:
+            action = torch.clamp(action, -1.0, 1.0)
         log_prob = dist.log_prob(action).sum(dim=-1)
         entropy = dist.entropy().sum(dim=-1)
-        return torch.clamp(action, -1.0, 1.0), log_prob, entropy
+        return action, log_prob, entropy
 
 
 class CentralizedCritic(nn.Module):
