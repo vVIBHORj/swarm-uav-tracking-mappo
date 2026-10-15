@@ -6,12 +6,13 @@ from algos.networks import SharedActor, CentralizedCritic
 
 
 class MAPPOManager:
-    def __init__(self, obs_dim, state_dim, act_dim=2, lr=3e-4, gamma=0.99, gae_lambda=0.95, clip_coef=0.2, device="cuda"):
+    def __init__(self, obs_dim, state_dim, act_dim=2, lr=3e-4, gamma=0.99, gae_lambda=0.95, clip_coef=0.2, device="cuda", seed=None):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.base_lr = lr
         self.gamma = gamma
         self.gae_lambda = gae_lambda
         self.clip_coef = clip_coef
+        self.rng = np.random.default_rng(seed)
 
         # Master networks on CUDA GPU
         self.actor = SharedActor(obs_dim, act_dim).to(self.device)
@@ -94,7 +95,7 @@ class MAPPOManager:
         entropies = []
 
         for _ in range(epochs):
-            np.random.shuffle(indices)
+            self.rng.shuffle(indices)
             for start in range(0, num_samples, batch_size):
                 mb = indices[start:start + batch_size]
 

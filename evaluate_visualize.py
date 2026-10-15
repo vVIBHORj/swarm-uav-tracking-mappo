@@ -1,5 +1,7 @@
 # evaluate_visualize.py
 import os
+import sys
+import csv
 import json
 import argparse
 from collections import defaultdict
@@ -12,7 +14,194 @@ from envs.uav_rgbt_env import UAVRGBTTrackingEnv
 from algos.networks import SharedActor
 
 
+# ---------------------------------------------------------------------------
+# Strict Observation-Based Baseline Policies (Fixing AUD-04)
+# ---------------------------------------------------------------------------
+
+def random_policy(obs_dict, env=None, rng=None):
+    """Uniform random continuous acceleration in [-1.0, 1.0]^2.
+    
+    Operates strictly on obs_dict keys without reading ground-truth arena state.
+    Supports deterministic evaluation when seeded rng is provided.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    return {a: rng.uniform(-1.0, 1.0, size=(2,)).astype(np.float32) for a in obs_dict}
+
+
+def greedy_nearest_policy(obs_dict, env=None):
+    """Uncoordinated Greedy Nearest-Target Pursuit.
+    
+    Operates strictly on the 39D local observation vector:
+      obs[0:2]   : own position / 100.0
+      obs[2:4]   : own velocity / 4.0
+      obs[12:36] : 4 targets (each 6D: rel_pos / 100.0, rel_vel / 4.0, rgb_flag, ir_flag)
+    Picks the nearest observed visible target and applies PD pursuit.
+    If all targets are occluded, gently damps toward arena center.
+    """
+    actions = {}
+    for a, obs in obs_dict.items():
+        own_pos = obs[0:2]
+        target_feats = obs[12:36].reshape(4, 6)
+        visible_mask = np.any(target_feats[:, :2] != 0.0, axis=-1) | (target_feats[:, 4] > 0) | (target_feats[:, 5] > 0)
+
+        if not np.any(visible_mask):
+            center_dir = np.array([0.5, 0.5], dtype=np.float32) - own_pos
+            actions[a] = np.clip(center_dir * 2.0, -1.0, 1.0).astype(np.float32)
+            continue
+
+        rel_pos = target_feats[:, :2]
+        rel_vel = target_feats[:, 2:4]
+        dists = np.where(visible_mask, np.linalg.norm(rel_pos, axis=-1), 1e6)
+        best_m = np.argmin(dists)
+
+        # PD pursuit: target relative position + velocity damping
+        pursuit_vec = rel_pos[best_m] * 100.0 + 0.25 * (rel_vel[best_m] * 4.0)
+        norm = np.linalg.norm(pursuit_vec) + 1e-6
+        actions[a] = np.clip(pursuit_vec / norm, -1.0, 1.0).astype(np.float32)
+
+    return actions
+
+
+def collision_aware_greedy_policy(obs_dict, env=None):
+    """Collision-Aware Greedy Heuristic (Stronger Baseline 1).
+    
+    Combines nearest-target PD pursuit from obs[12:36] with repulsive avoidance
+    from observed teammates (obs[4:6] and obs[8:10]) when closer than 6.0 sim_units (0.06 norm).
+    Operates strictly on 39D local observations without oracle coordinates.
+    """
+    actions = {}
+    for a, obs in obs_dict.items():
+        own_pos = obs[0:2]
+        target_feats = obs[12:36].reshape(4, 6)
+        visible_mask = np.any(target_feats[:, :2] != 0.0, axis=-1) | (target_feats[:, 4] > 0) | (target_feats[:, 5] > 0)
+
+        if not np.any(visible_mask):
+            base_vec = (np.array([0.5, 0.5], dtype=np.float32) - own_pos) * 2.0
+        else:
+            rel_pos = target_feats[:, :2]
+            rel_vel = target_feats[:, 2:4]
+            dists = np.where(visible_mask, np.linalg.norm(rel_pos, axis=-1), 1e6)
+            best_m = np.argmin(dists)
+            pursuit_vec = rel_pos[best_m] * 100.0 + 0.25 * (rel_vel[best_m] * 4.0)
+            norm = np.linalg.norm(pursuit_vec) + 1e-6
+            base_vec = pursuit_vec / norm
+
+        # Teammate repulsive separation (obs[4:6] and obs[8:10])
+        tm1_rel = obs[4:6]
+        tm2_rel = obs[8:10]
+        repulsion = np.zeros(2, dtype=np.float32)
+        safe_margin = 0.06  # 6.0 sim_units
+
+        for tm_rel in [tm1_rel, tm2_rel]:
+            tm_dist = np.linalg.norm(tm_rel)
+            if 0.0 < tm_dist < safe_margin:
+                repulsion += - (tm_rel / (tm_dist + 1e-6)) * (safe_margin - tm_dist) / safe_margin
+
+        combined = base_vec + 2.5 * repulsion
+        actions[a] = np.clip(combined, -1.0, 1.0).astype(np.float32)
+
+    return actions
+
+
+def target_assignment_heuristic_policy(obs_dict, env=None):
+    """Observation-Based Bipartite Target Assignment Heuristic (Stronger Baseline 2).
+    
+    Reconstructs observed targets and teammate positions purely from obs_dict,
+    performs greedy bipartite min-distance assignment so drones track distinct targets,
+    and adds teammate collision avoidance within 6.0 sim_units.
+    """
+    agents = list(obs_dict.keys())
+    drone_positions = {}
+    target_world_estimates = defaultdict(list)
+
+    # 1. Reconstruct visible target world positions from local observations
+    for a in agents:
+        obs = obs_dict[a]
+        own_pos = obs[0:2] * 100.0
+        drone_positions[a] = own_pos
+        target_feats = obs[12:36].reshape(4, 6)
+        for m in range(4):
+            is_vis = (np.linalg.norm(target_feats[m, :2]) > 0.0) or (target_feats[m, 4] > 0) or (target_feats[m, 5] > 0)
+            if is_vis:
+                tgt_world = own_pos + target_feats[m, :2] * 100.0
+                target_world_estimates[m].append(tgt_world)
+
+    # Centroid of observed targets
+    consensus_targets = {}
+    for m, est_list in target_world_estimates.items():
+        if est_list:
+            consensus_targets[m] = np.mean(est_list, axis=0)
+
+    # 2. Greedy bipartite matching: assign distinct targets to drones
+    assigned_targets = {}
+    unassigned_drones = list(agents)
+    available_target_indices = list(consensus_targets.keys())
+
+    # Build cost pairs (distance, drone, target_m)
+    cost_pairs = []
+    for a in unassigned_drones:
+        d_pos = drone_positions[a]
+        for m in available_target_indices:
+            dist = float(np.linalg.norm(d_pos - consensus_targets[m]))
+            cost_pairs.append((dist, a, m))
+
+    cost_pairs.sort(key=lambda x: x[0])
+    used_targets = set()
+    used_drones = set()
+
+    for dist, a, m in cost_pairs:
+        if a not in used_drones and m not in used_targets:
+            assigned_targets[a] = m
+            used_drones.add(a)
+            used_targets.add(m)
+
+    # 3. Generate actions with collision repulsion
+    actions = {}
+    for a in agents:
+        obs = obs_dict[a]
+        own_pos = drone_positions[a]
+
+        if a in assigned_targets:
+            tgt_m = assigned_targets[a]
+            tgt_world = consensus_targets[tgt_m]
+            pursuit_vec = tgt_world - own_pos
+            norm = np.linalg.norm(pursuit_vec) + 1e-6
+            base_vec = pursuit_vec / norm
+        else:
+            # Fallback to nearest local target or center
+            target_feats = obs[12:36].reshape(4, 6)
+            visible_mask = np.any(target_feats[:, :2] != 0.0, axis=-1)
+            if np.any(visible_mask):
+                dists = np.linalg.norm(target_feats[:, :2], axis=-1)
+                best_m = np.argmin(dists)
+                base_vec = target_feats[best_m, :2] / (dists[best_m] + 1e-6)
+            else:
+                base_vec = (np.array([50.0, 50.0]) - own_pos) / 50.0
+
+        # Teammate repulsion within 6.0 sim_units (0.06 norm)
+        tm1_rel = obs[4:6]
+        tm2_rel = obs[8:10]
+        repulsion = np.zeros(2, dtype=np.float32)
+        safe_margin = 0.06
+
+        for tm_rel in [tm1_rel, tm2_rel]:
+            tm_dist = np.linalg.norm(tm_rel)
+            if 0.0 < tm_dist < safe_margin:
+                repulsion += - (tm_rel / (tm_dist + 1e-6)) * (safe_margin - tm_dist) / safe_margin
+
+        combined = base_vec + 2.5 * repulsion
+        actions[a] = np.clip(combined, -1.0, 1.0).astype(np.float32)
+
+    return actions
+
+
+# ---------------------------------------------------------------------------
+# Evaluation Framework with Mean ± Std & Export
+# ---------------------------------------------------------------------------
+
 def run_policy_evaluation(env, policy_fn, episodes=30, record_trail=False):
+    """Evaluates a policy over seeded episodes and computes Mean ± Std metrics."""
     all_tcr = []
     all_overlap = []
     all_col = []
@@ -27,6 +216,7 @@ def run_policy_evaluation(env, policy_fn, episodes=30, record_trail=False):
 
     for ep in range(episodes):
         obs_dict, info_dict = env.reset(seed=5000 + ep)
+        ep_rng = np.random.default_rng(5000 + ep)
         done = False
         ep_tcr, ep_overlap, ep_col, ep_ate = [], [], [], []
 
@@ -47,7 +237,11 @@ def run_policy_evaluation(env, policy_fn, episodes=30, record_trail=False):
                 for m in range(env.num_targets):
                     target_trails[m].append(np.copy(env.target_pos[m]))
 
-            action_dict = policy_fn(obs_dict, env)
+            try:
+                action_dict = policy_fn(obs_dict, env=env, rng=ep_rng)
+            except TypeError:
+                action_dict = policy_fn(obs_dict, env=env)
+
             obs_dict, _, terms, truncs, infos = env.step(action_dict)
             done = any(terms.values()) or any(truncs.values())
 
@@ -85,10 +279,14 @@ def run_policy_evaluation(env, policy_fn, episodes=30, record_trail=False):
 
     results = {
         "mean_tcr": float(np.mean(all_tcr)),
+        "std_tcr": float(np.std(all_tcr)),
         "mean_ate": float(np.mean(all_ate)),
+        "std_ate": float(np.std(all_ate)),
         "mean_overlap": float(np.mean(all_overlap)),
+        "std_overlap": float(np.std(all_overlap)),
         "total_collisions": int(np.sum(all_col)),
         "mean_collisions_per_ep": float(np.mean(all_col)),
+        "std_collisions_per_ep": float(np.std(all_col)),
         "tag_breakdown": tag_breakdown
     }
 
@@ -98,55 +296,46 @@ def run_policy_evaluation(env, policy_fn, episodes=30, record_trail=False):
 
 
 def plot_swarm_trajectory_trails(drone_trails, target_trails, trail_metadata, save_path="results/swarm_trajectory_trails.png"):
-    """Generates publication-quality 2D arena trajectory trails with 25m sensor rings."""
+    """Visualizes 2D flight paths in dimensionless simulation units (sim_units)."""
     fig, ax = plt.subplots(figsize=(10, 10), dpi=200)
-    ax.set_facecolor("#0f172a")
-    fig.patch.set_facecolor("#0f172a")
+    ax.set_facecolor("#0b0f19")
+    fig.patch.set_facecolor("#020617")
 
-    # Grid
-    for g in range(0, 101, 10):
-        ax.axvline(g, color="#1e293b", linestyle="--", lw=0.8, alpha=0.6)
-        ax.axhline(g, color="#1e293b", linestyle="--", lw=0.8, alpha=0.6)
+    drone_colors = ["#38bdf8", "#4ade80", "#f43f5e"]
+    target_colors = ["#fbbf24", "#a855f7", "#ec4899", "#06b6d4"]
 
-    drone_colors = ["#38bdf8", "#818cf8", "#c084fc"]
-    target_colors = ["#22c55e", "#eab308", "#f97316", "#ef4444"]
-
-    # Plot Target Trails
+    # 1. Target Trails
     for m in range(len(target_trails)):
-        t_arr = np.array(target_trails[m])
-        col = target_colors[m % len(target_colors)]
-        meta = trail_metadata["records"][m]
-        tag_str = ",".join(meta["attributes"][:3])
-        label = f"Target-{m} ({meta['seq_id'][:12]}.. [{tag_str}])"
+        pts = np.array(target_trails[m])
+        if len(pts) == 0:
+            continue
+        c = target_colors[m % len(target_colors)]
+        meta = trail_metadata.get("records", [])
+        tags = meta[m].get("attributes", []) if m < len(meta) else []
+        tag_str = f" [{','.join(tags)}]" if tags else ""
+        ax.plot(pts[:, 0], pts[:, 1], color=c, lw=2.2, linestyle="--", alpha=0.9, label=f"Target {m}{tag_str}")
+        ax.scatter(pts[0, 0], pts[0, 1], color=c, marker="o", s=80, edgecolors="white", lw=1.5, zorder=5)
+        ax.scatter(pts[-1, 0], pts[-1, 1], color=c, marker="*", s=160, edgecolors="white", lw=1.5, zorder=5)
 
-        ax.plot(t_arr[:, 0], t_arr[:, 1], color=col, lw=2.2, linestyle="-.", label=label, alpha=0.85)
-        ax.scatter(t_arr[0, 0], t_arr[0, 1], color=col, s=70, marker="o", edgecolors="#ffffff", lw=1.2, zorder=5)
-        ax.scatter(t_arr[-1, 0], t_arr[-1, 1], color=col, s=90, marker="s", edgecolors="#ffffff", lw=1.2, zorder=5)
-        ax.text(t_arr[0, 0] + 1.2, t_arr[0, 1] + 1.2, f"T{m}_start", color=col, fontsize=9, fontweight="bold")
-        ax.text(t_arr[-1, 0] + 1.2, t_arr[-1, 1] + 1.2, f"T{m}_end", color=col, fontsize=9, fontweight="bold")
-
-    # Plot Drone Trails
-    sensor_radius = 25.0
+    # 2. Drone Trails
     for i in range(len(drone_trails)):
-        d_arr = np.array(drone_trails[i])
-        col = drone_colors[i % len(drone_colors)]
+        pts = np.array(drone_trails[i])
+        if len(pts) == 0:
+            continue
+        c = drone_colors[i % len(drone_colors)]
+        ax.plot(pts[:, 0], pts[:, 1], color=c, lw=2.8, alpha=0.95, label=f"Drone {i} (MAPPO)")
+        ax.scatter(pts[0, 0], pts[0, 1], color=c, marker="s", s=80, edgecolors="white", lw=1.5, zorder=5)
+        ax.scatter(pts[-1, 0], pts[-1, 1], color=c, marker="^", s=140, edgecolors="white", lw=1.5, zorder=5)
 
-        ax.plot(d_arr[:, 0], d_arr[:, 1], color=col, lw=2.5, label=f"UAV-{i} Swarm Track", alpha=0.95)
-        ax.scatter(d_arr[0, 0], d_arr[0, 1], color=col, s=80, marker="o", edgecolors="#ffffff", lw=1.5, zorder=6)
-        ax.scatter(d_arr[-1, 0], d_arr[-1, 1], color=col, s=120, marker="*", edgecolors="#ffffff", lw=1.5, zorder=6)
-        ax.text(d_arr[0, 0] - 3.5, d_arr[0, 1] - 3.0, f"UAV-{i}_start", color=col, fontsize=9, fontweight="bold")
-        ax.text(d_arr[-1, 0] - 3.5, d_arr[-1, 1] + 2.0, f"UAV-{i}_end", color=col, fontsize=10, fontweight="bold")
-
-        # 25m Sensor FOV Ring at final timestep
+        # Draw final FOV radius (25 sim_units)
         fov_circle = plt.Circle(
-            (d_arr[-1, 0], d_arr[-1, 1]),
-            sensor_radius,
-            color=col,
+            (pts[-1, 0], pts[-1, 1]),
+            25.0,
+            color=c,
             fill=True,
             alpha=0.08,
-            linestyle="--",
-            lw=1.5,
-            ec=col
+            linestyle=":",
+            lw=1.5
         )
         ax.add_patch(fov_circle)
 
@@ -160,8 +349,8 @@ def plot_swarm_trajectory_trails(drone_trails, target_trails, trail_metadata, sa
         fontweight="bold",
         pad=15
     )
-    ax.set_xlabel("Arena X (meters)", color="#94a3b8", fontsize=11)
-    ax.set_ylabel("Arena Y (meters)", color="#94a3b8", fontsize=11)
+    ax.set_xlabel("Simulated 2D Arena X (sim_units)", color="#94a3b8", fontsize=11)
+    ax.set_ylabel("Simulated 2D Arena Y (sim_units)", color="#94a3b8", fontsize=11)
     ax.tick_params(colors="#94a3b8")
 
     leg = ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), frameon=True, facecolor="#1e293b", edgecolor="#334155", fontsize=9)
@@ -174,131 +363,195 @@ def plot_swarm_trajectory_trails(drone_trails, target_trails, trail_metadata, sa
     print(f"[SAVED] High-resolution trajectory trails saved to {save_path}")
 
 
-def compare_all_baselines(checkpoint_path="checkpoints/mappo_actor_best.pt", episodes=30):
-    print(f"\n=======================================================")
-    print(f"   FULL BASELINE COMPARISON SUITE ({episodes} SEEDED TEST EPISODES)")
-    print(f"=======================================================")
+def compare_all_baselines(checkpoint_paths=None, episodes=30):
+    """Evaluates 5 observation-based policies across seeded episodes and reports Mean ± Std."""
+    if checkpoint_paths is None:
+        checkpoint_paths = ["checkpoints/mappo_actor_best.pt"]
+    elif isinstance(checkpoint_paths, str):
+        checkpoint_paths = [checkpoint_paths]
+
+    print("\n" + "=" * 80)
+    print(f"   5-POLICY OBSERVATION-ONLY BENCHMARK SUITE ({episodes} SEEDED TEST EPISODES)")
+    print("=" * 80)
 
     env = UAVRGBTTrackingEnv(num_drones=3, num_targets=4, split="test", render_mode=None)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 1. Random Policy
-    def random_policy(obs_dict, env):
-        return {a: np.random.uniform(-1.0, 1.0, size=(2,)).astype(np.float32) for a in env.agents}
+    all_benchmarks = {}
 
-    print("\n[1/3] Evaluating Random Policy Baseline...")
+    # 1. Random Policy
+    print("\n[1/5] Evaluating Random Policy Baseline...")
     rand_metrics = run_policy_evaluation(env, random_policy, episodes=episodes)
+    all_benchmarks["random_policy"] = rand_metrics
 
     # 2. Greedy Nearest-Target Heuristic
-    def greedy_policy(obs_dict, env):
-        actions = {}
-        for i, a in enumerate(env.agents):
-            dists = np.linalg.norm(env.target_pos - env.drone_pos[i], axis=-1)
-            closest_m = np.argmin(dists)
-            diff = env.target_pos[closest_m] - env.drone_pos[i]
-            norm = np.linalg.norm(diff) + 1e-6
-            actions[a] = np.clip(diff / norm, -1.0, 1.0).astype(np.float32)
-        return actions
+    print("[2/5] Evaluating Uncoordinated Greedy Nearest-Target Heuristic...")
+    greedy_metrics = run_policy_evaluation(env, greedy_nearest_policy, episodes=episodes)
+    all_benchmarks["greedy_nearest"] = greedy_metrics
 
-    print("[2/3] Evaluating Uncoordinated Greedy Nearest-Target Heuristic...")
-    greedy_metrics = run_policy_evaluation(env, greedy_policy, episodes=episodes)
+    # 3. Collision-Aware Greedy
+    print("[3/5] Evaluating Collision-Aware Greedy Heuristic...")
+    col_greedy_metrics = run_policy_evaluation(env, collision_aware_greedy_policy, episodes=episodes)
+    all_benchmarks["collision_aware_greedy"] = col_greedy_metrics
 
-    # 3. Trained MAPPO CTDE Swarm (Ours)
-    actor = SharedActor(obs_dim=env.obs_dim, act_dim=2).to(device)
-    if not os.path.exists(checkpoint_path):
-        checkpoint_path = "checkpoints/mappo_actor_latest.pt"
-    actor.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=True))
-    actor.eval()
+    # 4. Target Assignment Heuristic
+    print("[4/5] Evaluating Target Assignment Bipartite Matching Heuristic...")
+    assign_metrics = run_policy_evaluation(env, target_assignment_heuristic_policy, episodes=episodes)
+    all_benchmarks["target_assignment_heuristic"] = assign_metrics
 
-    def mappo_policy(obs_dict, env):
-        obs_array = np.stack([obs_dict[a] for a in env.agents]).astype(np.float32)
-        obs_tensor = torch.tensor(obs_array, dtype=torch.float32, device=device)
-        with torch.no_grad():
-            act_t, _, _ = actor.get_action_and_logprob(obs_tensor, deterministic=True, update_norm=False)
-        actions_np = act_t.cpu().numpy()
-        return {a: actions_np[i] for i, a in enumerate(env.agents)}
+    # 5. Trained MAPPO CTDE Swarm
+    mappo_eval_list = []
+    last_d_trails, last_t_trails, last_t_meta = None, None, None
 
-    print(f"[3/3] Evaluating Trained MAPPO CTDE Swarm ({checkpoint_path})...")
-    mappo_metrics, d_trails, t_trails, t_meta = run_policy_evaluation(
-        env, mappo_policy, episodes=episodes, record_trail=True
-    )
+    for idx, ckpt in enumerate(checkpoint_paths):
+        if not os.path.exists(ckpt):
+            fallback = "checkpoints/mappo_actor_latest.pt"
+            if os.path.exists(fallback):
+                ckpt = fallback
+            else:
+                print(f"[WARNING] Checkpoint {ckpt} not found, skipping.")
+                continue
 
-    # Generate swarm trajectory trail plot for episode 1
-    plot_swarm_trajectory_trails(d_trails, t_trails, t_meta, save_path="results/swarm_trajectory_trails.png")
+        print(f"[5/5] Evaluating MAPPO Swarm Checkpoint {idx+1}/{len(checkpoint_paths)} ({ckpt})...")
+        actor = SharedActor(obs_dim=env.obs_dim, act_dim=2).to(device)
+        actor.load_state_dict(torch.load(ckpt, map_location=device, weights_only=True))
+        actor.eval()
+
+        def mappo_policy(obs_dict, env=None, rng=None):
+            obs_array = np.stack([obs_dict[a] for a in env.agents]).astype(np.float32)
+            obs_tensor = torch.tensor(obs_array, dtype=torch.float32, device=device)
+            with torch.no_grad():
+                act_t, _, _ = actor.get_action_and_logprob(obs_tensor, deterministic=True, update_norm=False)
+            actions_np = act_t.cpu().numpy()
+            return {a: actions_np[i] for i, a in enumerate(env.agents)}
+
+        m_metrics, d_trails, t_trails, t_meta = run_policy_evaluation(
+            env, mappo_policy, episodes=episodes, record_trail=True
+        )
+        mappo_eval_list.append(m_metrics)
+        last_d_trails, last_t_trails, last_t_meta = d_trails, t_trails, t_meta
+
+    if mappo_eval_list:
+        # Aggregate across checkpoints if multiple provided
+        agg_mappo = {
+            "mean_tcr": float(np.mean([m["mean_tcr"] for m in mappo_eval_list])),
+            "std_tcr": float(np.mean([m["std_tcr"] for m in mappo_eval_list])),
+            "mean_ate": float(np.mean([m["mean_ate"] for m in mappo_eval_list])),
+            "std_ate": float(np.mean([m["std_ate"] for m in mappo_eval_list])),
+            "mean_overlap": float(np.mean([m["mean_overlap"] for m in mappo_eval_list])),
+            "std_overlap": float(np.mean([m["std_overlap"] for m in mappo_eval_list])),
+            "total_collisions": int(np.mean([m["total_collisions"] for m in mappo_eval_list])),
+            "mean_collisions_per_ep": float(np.mean([m["mean_collisions_per_ep"] for m in mappo_eval_list])),
+            "std_collisions_per_ep": float(np.mean([m["std_collisions_per_ep"] for m in mappo_eval_list])),
+            "tag_breakdown": mappo_eval_list[0]["tag_breakdown"]
+        }
+        all_benchmarks["mappo_ctde_swarm"] = agg_mappo
+        if last_d_trails is not None:
+            plot_swarm_trajectory_trails(last_d_trails, last_t_trails, last_t_meta, save_path="results/swarm_trajectory_trails.png")
+    else:
+        print("[ERROR] No valid MAPPO checkpoints could be evaluated.")
 
     env.close()
 
-    # Formatted Comparison Table
-    print("\n" + "=" * 78)
-    print(f"{'Metric':<32} | {'Random Policy':<13} | {'Greedy Heuristic':<16} | {'MAPPO Swarm (Ours)':<16}")
-    print("-" * 78)
-    print(f"{'Target Coverage Ratio (TCR %)':<32} | {rand_metrics['mean_tcr']*100:11.2f}% | {greedy_metrics['mean_tcr']*100:14.2f}% | {mappo_metrics['mean_tcr']*100:14.2f}%")
-    print(f"{'Avg Tracking Error (ATE m)':<32} | {rand_metrics['mean_ate']:11.2f}m | {greedy_metrics['mean_ate']:14.2f}m | {mappo_metrics['mean_ate']:14.2f}m")
-    print(f"{'Redundant Overlaps / step':<32} | {rand_metrics['mean_overlap']:12.3f} | {greedy_metrics['mean_overlap']:15.3f} | {mappo_metrics['mean_overlap']:15.3f}")
-    print(f"{'Inter-Drone Collisions / ep':<32} | {rand_metrics['mean_collisions_per_ep']:12.2f} | {greedy_metrics['mean_collisions_per_ep']:15.2f} | {mappo_metrics['mean_collisions_per_ep']:15.2f}")
-    print("=" * 78)
-
-    # Per-Attribute Comparison Table
-    all_tags = sorted(list(mappo_metrics["tag_breakdown"].keys()))
-    print(f"\n--- Challenge Attribute Coverage Breakdown (TCR %) ---")
-    print(f"{'Attribute Tag':<14} | {'Random':<10} | {'Greedy':<10} | {'MAPPO (Ours)':<12}")
-    print("-" * 52)
-    for tag in all_tags:
-        r_tcr = rand_metrics["tag_breakdown"].get(tag, {}).get("tcr", 0.0) * 100.0
-        g_tcr = greedy_metrics["tag_breakdown"].get(tag, {}).get("tcr", 0.0) * 100.0
-        m_tcr = mappo_metrics["tag_breakdown"].get(tag, {}).get("tcr", 0.0) * 100.0
-        print(f"{tag:<14} | {r_tcr:8.1f}% | {g_tcr:8.1f}% | {m_tcr:10.1f}%")
-    print("=" * 52)
-
-    # Save JSON benchmark metrics
-    full_benchmark = {
-        "random_policy": rand_metrics,
-        "greedy_heuristic": greedy_metrics,
-        "mappo_ctde_swarm": mappo_metrics
-    }
+    # Save quantitative JSON metrics
     json_path = "results/final_benchmark_metrics.json"
     with open(json_path, "w") as f:
-        json.dump(full_benchmark, f, indent=2)
-    print(f"\n[SAVED] Quantitative metrics saved to {json_path}")
+        json.dump({
+            "metadata": {
+                "episodes": episodes,
+                "max_steps": 200,
+                "seed_range": [5000, 5000 + episodes - 1],
+                "units": "dimensionless simulation units (sim_units)"
+            },
+            "benchmarks": all_benchmarks
+        }, f, indent=2)
+    print(f"\n[SAVED] Benchmark metrics saved to {json_path}")
 
-    # Generate 3-Panel Publication Comparison Bar Chart
-    methods = ["Random\nPolicy", "Greedy\nHeuristic", "MAPPO Swarm\n(Ours)"]
-    tcrs = [rand_metrics["mean_tcr"] * 100.0, greedy_metrics["mean_tcr"] * 100.0, mappo_metrics["mean_tcr"] * 100.0]
-    ates = [rand_metrics["mean_ate"], greedy_metrics["mean_ate"], mappo_metrics["mean_ate"]]
-    cols = [rand_metrics["mean_collisions_per_ep"], greedy_metrics["mean_collisions_per_ep"], mappo_metrics["mean_collisions_per_ep"]]
+    # Save CSV metrics
+    csv_path = "results/final_benchmark_metrics.csv"
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "Policy",
+            "TCR_Mean_Pct", "TCR_Std_Pct",
+            "ATE_Mean_sim_units", "ATE_Std_sim_units",
+            "Overlap_Mean", "Overlap_Std",
+            "Collisions_Mean_per_ep", "Collisions_Std_per_ep",
+            "Total_Collisions"
+        ])
+        for p_name, m in all_benchmarks.items():
+            writer.writerow([
+                p_name,
+                f"{m['mean_tcr']*100:.2f}", f"{m['std_tcr']*100:.2f}",
+                f"{m['mean_ate']:.2f}", f"{m['std_ate']:.2f}",
+                f"{m['mean_overlap']:.3f}", f"{m['std_overlap']:.3f}",
+                f"{m['mean_collisions_per_ep']:.2f}", f"{m['std_collisions_per_ep']:.2f}",
+                m["total_collisions"]
+            ])
+    print(f"[SAVED] Tabular CSV metrics saved to {csv_path}")
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), dpi=200)
-    bar_colors = ["#94a3b8", "#f59e0b", "#10b981"]
+    # Formatted Comparison Table
+    print("\n" + "=" * 105)
+    headers = f"{'Metric':<30} | {'Random':<12} | {'Greedy':<12} | {'Col-Greedy':<12} | {'Target-Assign':<14} | {'MAPPO (Ours)':<14}"
+    print(headers)
+    print("-" * 105)
+
+    def fmt_stat(m, key, mult=1.0, fmt=".1f"):
+        mean_v = m[f"mean_{key}"] * mult
+        std_v = m[f"std_{key}"] * mult
+        return f"{mean_v:{fmt}} +/- {std_v:{fmt}}"
+
+    print(f"{'Target Coverage (TCR %)':<30} | {fmt_stat(rand_metrics, 'tcr', 100.0, '.1f'):<12} | {fmt_stat(greedy_metrics, 'tcr', 100.0, '.1f'):<12} | {fmt_stat(col_greedy_metrics, 'tcr', 100.0, '.1f'):<12} | {fmt_stat(assign_metrics, 'tcr', 100.0, '.1f'):<14} | {fmt_stat(all_benchmarks.get('mappo_ctde_swarm', rand_metrics), 'tcr', 100.0, '.1f'):<14}")
+    print(f"{'Tracking Error (ATE sim_units)':<30} | {fmt_stat(rand_metrics, 'ate', 1.0, '.1f'):<12} | {fmt_stat(greedy_metrics, 'ate', 1.0, '.1f'):<12} | {fmt_stat(col_greedy_metrics, 'ate', 1.0, '.1f'):<12} | {fmt_stat(assign_metrics, 'ate', 1.0, '.1f'):<14} | {fmt_stat(all_benchmarks.get('mappo_ctde_swarm', rand_metrics), 'ate', 1.0, '.1f'):<14}")
+    print(f"{'Redundant Overlaps / step':<30} | {fmt_stat(rand_metrics, 'overlap', 1.0, '.2f'):<12} | {fmt_stat(greedy_metrics, 'overlap', 1.0, '.2f'):<12} | {fmt_stat(col_greedy_metrics, 'overlap', 1.0, '.2f'):<12} | {fmt_stat(assign_metrics, 'overlap', 1.0, '.2f'):<14} | {fmt_stat(all_benchmarks.get('mappo_ctde_swarm', rand_metrics), 'overlap', 1.0, '.2f'):<14}")
+    print(f"{'Inter-Drone Collisions / ep':<30} | {fmt_stat(rand_metrics, 'collisions_per_ep', 1.0, '.2f'):<12} | {fmt_stat(greedy_metrics, 'collisions_per_ep', 1.0, '.2f'):<12} | {fmt_stat(col_greedy_metrics, 'collisions_per_ep', 1.0, '.2f'):<12} | {fmt_stat(assign_metrics, 'collisions_per_ep', 1.0, '.2f'):<14} | {fmt_stat(all_benchmarks.get('mappo_ctde_swarm', rand_metrics), 'collisions_per_ep', 1.0, '.2f'):<14}")
+    print("=" * 105)
+
+    # 3-Panel Publication-Quality Comparison Bar Chart with Error Bars
+    policy_labels = ["Random", "Greedy", "Col-Greedy", "Target-Assign", "MAPPO Swarm\n(Ours)"]
+    metric_keys = ["random_policy", "greedy_nearest", "collision_aware_greedy", "target_assignment_heuristic", "mappo_ctde_swarm"]
+    bar_colors = ["#94a3b8", "#f59e0b", "#3b82f6", "#8b5cf6", "#10b981"]
+
+    tcr_means = [all_benchmarks[k]["mean_tcr"] * 100.0 for k in metric_keys if k in all_benchmarks]
+    tcr_stds = [all_benchmarks[k]["std_tcr"] * 100.0 for k in metric_keys if k in all_benchmarks]
+
+    ate_means = [all_benchmarks[k]["mean_ate"] for k in metric_keys if k in all_benchmarks]
+    ate_stds = [all_benchmarks[k]["std_ate"] for k in metric_keys if k in all_benchmarks]
+
+    col_means = [all_benchmarks[k]["mean_collisions_per_ep"] for k in metric_keys if k in all_benchmarks]
+    col_stds = [all_benchmarks[k]["std_collisions_per_ep"] for k in metric_keys if k in all_benchmarks]
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5.0), dpi=200)
 
     # 1. TCR
-    b1 = axes[0].bar(methods, tcrs, color=bar_colors, width=0.55, edgecolor="#0f172a", lw=1.2)
-    axes[0].set_title("Target Coverage Ratio (TCR %)", fontsize=11, fontweight="bold")
+    b1 = axes[0].bar(policy_labels[:len(tcr_means)], tcr_means, yerr=tcr_stds, capsize=4, color=bar_colors[:len(tcr_means)], width=0.55, edgecolor="#0f172a", lw=1.2)
+    axes[0].set_title("Target Coverage Ratio (TCR %)", fontsize=12, fontweight="bold")
     axes[0].set_ylabel("Coverage (%)", fontsize=10)
     axes[0].set_ylim(0, 100)
     axes[0].grid(True, linestyle="--", alpha=0.5, axis="y")
     for bar in b1:
         yval = bar.get_height()
-        axes[0].text(bar.get_x() + bar.get_width() / 2.0, yval + 1.5, f"{yval:.1f}%", ha="center", va="bottom", fontsize=10, fontweight="bold")
+        axes[0].text(bar.get_x() + bar.get_width() / 2.0, max(2.0, yval - 7.0), f"{yval:.1f}%", ha="center", va="bottom", fontsize=9, fontweight="bold", color="white")
 
     # 2. ATE
-    b2 = axes[1].bar(methods, ates, color=bar_colors, width=0.55, edgecolor="#0f172a", lw=1.2)
-    axes[1].set_title("Average Tracking Error (ATE m)", fontsize=11, fontweight="bold")
-    axes[1].set_ylabel("Error (meters)", fontsize=10)
+    b2 = axes[1].bar(policy_labels[:len(ate_means)], ate_means, yerr=ate_stds, capsize=4, color=bar_colors[:len(ate_means)], width=0.55, edgecolor="#0f172a", lw=1.2)
+    axes[1].set_title("Average Tracking Error (ATE sim_units)", fontsize=12, fontweight="bold")
+    axes[1].set_ylabel("Tracking Error (sim_units)", fontsize=10)
     axes[1].grid(True, linestyle="--", alpha=0.5, axis="y")
     for bar in b2:
         yval = bar.get_height()
-        axes[1].text(bar.get_x() + bar.get_width() / 2.0, yval + 0.8, f"{yval:.1f}m", ha="center", va="bottom", fontsize=10, fontweight="bold")
+        axes[1].text(bar.get_x() + bar.get_width() / 2.0, max(1.0, yval - 5.0), f"{yval:.1f}", ha="center", va="bottom", fontsize=9, fontweight="bold", color="white")
 
     # 3. Collisions
-    b3 = axes[2].bar(methods, cols, color=bar_colors, width=0.55, edgecolor="#0f172a", lw=1.2)
-    axes[2].set_title("Inter-Drone Collisions / Episode", fontsize=11, fontweight="bold")
+    b3 = axes[2].bar(policy_labels[:len(col_means)], col_means, yerr=col_stds, capsize=4, color=bar_colors[:len(col_means)], width=0.55, edgecolor="#0f172a", lw=1.2)
+    axes[2].set_title("Inter-Drone Collisions / Episode", fontsize=12, fontweight="bold")
     axes[2].set_ylabel("Collisions / Ep", fontsize=10)
     axes[2].grid(True, linestyle="--", alpha=0.5, axis="y")
     for bar in b3:
         yval = bar.get_height()
-        axes[2].text(bar.get_x() + bar.get_width() / 2.0, yval + 0.3, f"{yval:.2f}", ha="center", va="bottom", fontsize=10, fontweight="bold")
+        axes[2].text(bar.get_x() + bar.get_width() / 2.0, yval + 0.3, f"{yval:.2f}", ha="center", va="bottom", fontsize=9, fontweight="bold")
 
-    plt.suptitle("Anti-UAV-RGBT Benchmark: MAPPO Swarm vs. Heuristic Baselines", fontsize=13, fontweight="bold", y=1.02)
+    plt.suptitle("Anti-UAV-RGBT Benchmark: MAPPO Swarm vs. 4 Observation-Only Baselines", fontsize=14, fontweight="bold", y=1.02)
     plt.tight_layout()
     chart_path = "results/baseline_comparison.png"
     plt.savefig(chart_path, dpi=200, bbox_inches="tight")
@@ -307,6 +560,7 @@ def compare_all_baselines(checkpoint_path="checkpoints/mappo_actor_best.pt", epi
 
 
 def evaluate_test_split(checkpoint_path="checkpoints/mappo_actor_best.pt", episodes=20, render=False, save_gif=False):
+    """Evaluates a single policy checkpoint deterministically on held-out test split."""
     if not os.path.exists(checkpoint_path):
         fallback = "checkpoints/mappo_actor_latest.pt"
         if os.path.exists(fallback):
@@ -386,7 +640,7 @@ def evaluate_test_split(checkpoint_path="checkpoints/mappo_actor_best.pt", episo
 
         print(
             f"Test Episode {ep + 1:2d} | Coverage (TCR): {np.mean(ep_tcr):6.2%} | "
-            f"ATE: {np.mean(ep_ate):4.1f}m | Redundant Overlaps: {np.mean(ep_overlap):.2f} | Collisions: {int(np.sum(ep_col)):2d}"
+            f"ATE: {np.mean(ep_ate):4.1f} sim_units | Redundant Overlaps: {np.mean(ep_overlap):.2f} | Collisions: {int(np.sum(ep_col)):2d}"
         )
 
     env.close()
@@ -394,11 +648,11 @@ def evaluate_test_split(checkpoint_path="checkpoints/mappo_actor_best.pt", episo
     print("\n" + "=" * 50)
     print("      HELD-OUT TEST SPLIT OVERALL SUMMARY")
     print("=" * 50)
-    print(f"Mean Target Coverage Ratio (TCR) : {np.mean(all_tcr):.2%}")
-    print(f"Mean Average Tracking Error (ATE): {np.mean(all_ate):.2f} m")
-    print(f"Mean Redundancy / Overlap Rate   : {np.mean(all_overlap):.3f}")
+    print(f"Mean Target Coverage Ratio (TCR) : {np.mean(all_tcr):.2%} ± {np.std(all_tcr):.2%}")
+    print(f"Mean Average Tracking Error (ATE): {np.mean(all_ate):.2f} ± {np.std(all_ate):.2f} sim_units")
+    print(f"Mean Redundancy / Overlap Rate   : {np.mean(all_overlap):.3f} ± {np.std(all_overlap):.3f}")
     print(f"Total Inter-Drone Collisions     : {int(np.sum(all_col))}")
-    print(f"Average Collisions / Episode     : {np.mean(all_col):.2f}")
+    print(f"Average Collisions / Episode     : {np.mean(all_col):.2f} ± {np.std(all_col):.2f}")
 
     if tag_total_counts:
         print("\n--- Challenge Attribute Breakdown (Target Coverage Ratio) ---")
@@ -439,14 +693,17 @@ def evaluate_test_split(checkpoint_path="checkpoints/mappo_actor_best.pt", episo
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate & Benchmark MAPPO Swarm on Anti-UAV-RGBT")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/mappo_actor_best.pt", help="Path to actor checkpoint")
+    parser.add_argument("--checkpoints", nargs="*", default=None, help="Optional multiple actor checkpoints for cross-seed benchmark")
     parser.add_argument("--episodes", type=int, default=30, help="Number of test episodes")
-    parser.add_argument("--compare-baselines", action="store_true", help="Run full 3-policy baseline comparison suite")
+    parser.add_argument("--compare-baselines", action="store_true", help="Run full 5-policy baseline comparison suite")
     parser.add_argument("--render", action="store_true", help="Launch live Pygame visualizer")
     parser.add_argument("--save-gif", action="store_true", help="Record and save episode preview GIF/PNG")
     args = parser.parse_args()
 
+    ckpts = args.checkpoints if args.checkpoints else [args.checkpoint]
+
     if args.compare_baselines:
-        compare_all_baselines(checkpoint_path=args.checkpoint, episodes=args.episodes)
+        compare_all_baselines(checkpoint_paths=ckpts, episodes=args.episodes)
     else:
         num_eps = args.episodes if not args.render else (args.episodes if args.episodes != 30 else 5)
         evaluate_test_split(checkpoint_path=args.checkpoint, episodes=num_eps, render=args.render, save_gif=args.save_gif)

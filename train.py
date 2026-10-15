@@ -1,8 +1,15 @@
 # train.py
 import os
+import sys
 import time
 import random
 import argparse
+import datetime
+import platform
+import subprocess
+import json
+import shutil
+import psutil
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -10,6 +17,14 @@ from torch.utils.tensorboard import SummaryWriter
 
 from envs.uav_rgbt_env import UAVRGBTTrackingEnv
 from algos.mappo_agent import MAPPOManager
+
+
+def get_git_commit_hash():
+    """Retrieve active git commit hash for experiment provenance."""
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL).decode("ascii").strip()
+    except Exception:
+        return "unknown"
 
 
 def evaluate_validation_split(val_env, agent, num_episodes=10):
@@ -50,7 +65,13 @@ def train_mappo_rgbt(
     batch_size=512,
     resume=False,
     lr=3e-4,
-    seed=42
+    seed=42,
+    exp_name="default",
+    w_overlap=1.25,
+    w_col=6.0,
+    indiv_weight=0.25,
+    sensor_dropout=0.0,
+    ou_weight=0.20,
 ):
     # Set deterministic random seeds (AUD-05)
     random.seed(seed)
@@ -61,15 +82,81 @@ def train_mappo_rgbt(
 
     os.makedirs("checkpoints", exist_ok=True)
     os.makedirs("results", exist_ok=True)
-    writer = SummaryWriter("runs/mappo_anti_uav_rgbt")
+    writer = SummaryWriter(f"runs/{exp_name}_anti_uav_rgbt" if exp_name != "default" else "runs/mappo_anti_uav_rgbt")
 
-    train_env = UAVRGBTTrackingEnv(num_drones=3, num_targets=4, split="train")
-    val_env = UAVRGBTTrackingEnv(num_drones=3, num_targets=4, split="val")
-    agent = MAPPOManager(obs_dim=train_env.obs_dim, state_dim=train_env.state_dim, lr=lr, device="cuda")
+    train_env = UAVRGBTTrackingEnv(
+        num_drones=3,
+        num_targets=4,
+        split="train",
+        w_overlap=w_overlap,
+        w_col=w_col,
+        indiv_weight=indiv_weight,
+        sensor_dropout=sensor_dropout,
+        ou_weight=ou_weight,
+    )
+    val_env = UAVRGBTTrackingEnv(
+        num_drones=3,
+        num_targets=4,
+        split="val",
+        w_overlap=w_overlap,
+        w_col=w_col,
+        indiv_weight=indiv_weight,
+        sensor_dropout=sensor_dropout,
+        ou_weight=ou_weight,
+    )
+    agent = MAPPOManager(
+        obs_dim=train_env.obs_dim,
+        state_dim=train_env.state_dim,
+        lr=lr,
+        device="cuda",
+        seed=seed,
+    )
+
+    # Save experiment configuration and metadata for full reproducibility
+    config_data = {
+        "exp_name": exp_name,
+        "seed": seed,
+        "total_timesteps": total_timesteps,
+        "rollout_steps": rollout_steps,
+        "batch_size": batch_size,
+        "lr": lr,
+        "reward_weights": {
+            "w_overlap": w_overlap,
+            "w_col": w_col,
+            "indiv_weight": indiv_weight,
+            "sensor_dropout": sensor_dropout,
+            "ou_weight": ou_weight,
+        },
+        "environment": {
+            "arena_size": 100.0,
+            "sensor_radius": 25.0,
+            "d_safe": 2.5,
+            "max_steps": 200,
+            "units": "dimensionless simulation units (sim_units, sim_units/s)"
+        },
+        "system": {
+            "python_version": sys.version,
+            "platform": platform.platform(),
+            "torch_version": torch.__version__,
+            "cuda_available": torch.cuda.is_available(),
+            "cuda_device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU",
+            "git_commit": get_git_commit_hash(),
+            "timestamp": datetime.datetime.now().isoformat(),
+        },
+        "reproducibility_notes": (
+            "CPU environment transitions and numpy random operations are strictly seeded and deterministic. "
+            "Note that CUDA atomic operations can introduce minor floating-point divergence across different GPU architectures "
+            "unless torch.use_deterministic_algorithms(True) is explicitly enforced."
+        )
+    }
+    config_path = f"results/train_config_{exp_name}.json"
+    with open(config_path, "w") as f:
+        json.dump(config_data, f, indent=2)
+    print(f"[CONFIG] Experiment metadata and reproducibility parameters saved to {config_path}")
 
     start_step = 0
     best_val_tcr = -1.0
-    history_file = "results/training_history.npz"
+    history_file = f"results/training_history_{exp_name}.npz" if exp_name != "default" else "results/training_history.npz"
 
     history_steps = []
     history_rew = []
@@ -78,13 +165,20 @@ def train_mappo_rgbt(
     history_ate = []
     history_overlap = []
 
+    # Checkpoint paths with backward compatibility
+    ckpt_prefix = f"checkpoints/{exp_name}" if exp_name != "default" else "checkpoints/mappo"
+    actor_best_path = f"{ckpt_prefix}_actor_best.pt"
+    actor_latest_path = f"{ckpt_prefix}_actor_latest.pt"
+    critic_best_path = f"{ckpt_prefix}_critic_best.pt"
+    critic_latest_path = f"{ckpt_prefix}_critic_latest.pt"
+
     if resume:
-        actor_ckpt = "checkpoints/mappo_actor_best.pt"
+        actor_ckpt = actor_best_path
         if not os.path.exists(actor_ckpt):
-            actor_ckpt = "checkpoints/mappo_actor_latest.pt"
-        critic_ckpt = "checkpoints/mappo_critic_best.pt"
+            actor_ckpt = actor_latest_path
+        critic_ckpt = critic_best_path
         if not os.path.exists(critic_ckpt):
-            critic_ckpt = "checkpoints/mappo_critic_latest.pt"
+            critic_ckpt = critic_latest_path
 
         if os.path.exists(actor_ckpt):
             print(f"[RESUME] Loading actor weights from {actor_ckpt}")
@@ -114,6 +208,7 @@ def train_mappo_rgbt(
                 best_val_tcr = float(np.max(history_tcr) / 100.0)
             print(f"[RESUME] Resuming from step {start_step:,} | Previous Best Val TCR: {best_val_tcr:.2%}")
 
+    episode_idx = 0
     obs_dict, info_dict = train_env.reset(seed=seed)
     global_step = start_step
     target_global_step = start_step + total_timesteps
@@ -131,6 +226,7 @@ def train_mappo_rgbt(
         tcr_list, col_list, ate_list, overlap_list = [], [], [], []
         breakdown_accum = {}
 
+        t_rollout_start = time.time()
         # High-speed rollout collection (zero CUDA driver latency)
         for _ in range(rollout_steps):
             global_step += 1
@@ -174,9 +270,13 @@ def train_mappo_rgbt(
                         breakdown_accum[k] = breakdown_accum.get(k, 0.0) + float(v)
 
             if done:
-                obs_dict, info_dict = train_env.reset()
+                episode_idx += 1
+                obs_dict, info_dict = train_env.reset(seed=seed * 10000 + episode_idx)
             else:
                 obs_dict, info_dict = next_obs_dict, next_info_dict
+
+        rollout_time = max(1e-5, time.time() - t_rollout_start)
+        rollout_fps = int(rollout_steps / rollout_time)
 
         # Flatten rollout buffers: N agents per step
         N = train_env.num_drones
@@ -193,7 +293,7 @@ def train_mappo_rgbt(
         advs, rets = agent.compute_gae(rew_buf, val_buf, done_buf, next_val)
 
         # GPU PPO update with per-agent advantage credit assignment (AUD-01 & AUD-06)
-        # Note: running normalizers are updated at the end of agent.update() to eliminate ratio drift!
+        t_update_start = time.time()
         update_stats = agent.update(
             obs_b=obs_b,
             state_b=state_b,
@@ -205,6 +305,14 @@ def train_mappo_rgbt(
             epochs=10,
             batch_size=batch_size
         )
+        update_time = max(1e-5, time.time() - t_update_start)
+        update_samples = len(obs_b) * 10
+        update_throughput = int(update_samples / update_time)
+
+        # Memory profiling
+        vram_alloc = torch.cuda.memory_allocated() / (1024 * 1024) if torch.cuda.is_available() else 0.0
+        vram_res = torch.cuda.memory_reserved() / (1024 * 1024) if torch.cuda.is_available() else 0.0
+        process_ram = psutil.Process().memory_info().rss / (1024 * 1024)
 
         rollout_count += 1
         elapsed = time.time() - start_time
@@ -226,6 +334,9 @@ def train_mappo_rgbt(
         writer.add_scalar("Train/Actor_Loss", update_stats["actor_loss"], global_step)
         writer.add_scalar("Train/Critic_Loss", update_stats["critic_loss"], global_step)
         writer.add_scalar("Train/Entropy", update_stats["entropy"], global_step)
+        writer.add_scalar("Profile/Rollout_FPS", rollout_fps, global_step)
+        writer.add_scalar("Profile/Update_Throughput", update_throughput, global_step)
+        writer.add_scalar("Profile/VRAM_Alloc_MB", vram_alloc, global_step)
 
         # Log decomposed reward components (AUD-09)
         if breakdown_accum:
@@ -248,20 +359,24 @@ def train_mappo_rgbt(
             writer.add_scalar("Val/Overlap", val_overlap, global_step)
 
             print(
-                f"Step: {global_step:7d}/{target_global_step:,} | FPS: {fps:4d} | Train TCR: {mean_tcr:6.2%} | "
-                f"Val TCR: {val_tcr:6.2%} | Val Overlap: {val_overlap:.2f} | Val Col: {val_col:.3f} | Val ATE: {val_ate:.1f} sim_units"
+                f"Step: {global_step:7d}/{target_global_step:,} | Overall FPS: {fps:4d} (Rollout: {rollout_fps} FPS, Update: {update_throughput} samples/s) | "
+                f"VRAM: {vram_alloc:.1f}MB (Res: {vram_res:.1f}MB) | RAM: {process_ram:.1f}MB\n"
+                f"       Train TCR: {mean_tcr:6.2%} | Val TCR: {val_tcr:6.2%} | Val Overlap: {val_overlap:.2f} | Val Col: {val_col:.3f} | Val ATE: {val_ate:.1f} sim_units"
             )
 
             # Save latest checkpoints
-            torch.save(agent.actor.state_dict(), "checkpoints/mappo_actor_latest.pt")
-            torch.save(agent.critic.state_dict(), "checkpoints/mappo_critic_latest.pt")
+            torch.save(agent.actor.state_dict(), actor_latest_path)
+            torch.save(agent.critic.state_dict(), critic_latest_path)
 
             # Save best checkpoints
             if val_tcr >= best_val_tcr:
                 best_val_tcr = val_tcr
-                torch.save(agent.actor.state_dict(), "checkpoints/mappo_actor_best.pt")
-                torch.save(agent.critic.state_dict(), "checkpoints/mappo_critic_best.pt")
+                torch.save(agent.actor.state_dict(), actor_best_path)
+                torch.save(agent.critic.state_dict(), critic_best_path)
                 print(f"  --> [NEW BEST] Checkpoint saved: Val TCR = {val_tcr:.2%}")
+                if exp_name == "seed42":
+                    torch.save(agent.actor.state_dict(), "checkpoints/mappo_actor_best.pt")
+                    torch.save(agent.critic.state_dict(), "checkpoints/mappo_critic_best.pt")
 
     writer.close()
 
@@ -300,9 +415,14 @@ def train_mappo_rgbt(
     axes[2].grid(True, linestyle="--", alpha=0.5)
 
     plt.tight_layout()
-    curve_path = "results/training_curves.png"
+    curve_path = f"results/training_curves_{exp_name}.png" if exp_name != "default" else "results/training_curves.png"
     plt.savefig(curve_path, dpi=200)
     plt.close()
+
+    if exp_name == "seed42":
+        shutil.copyfile(history_file, "results/training_history.npz")
+        shutil.copyfile(curve_path, "results/training_curves.png")
+
     print(f"[DONE] Final Best Validation TCR: {best_val_tcr:.2%} | Full curve saved to {curve_path}")
 
 
@@ -315,6 +435,12 @@ if __name__ == "__main__":
     parser.add_argument("--resume", action="store_true", help="Resume from best checkpoint and append history")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--exp-name", type=str, default="default", help="Experiment name for tagging checkpoints/results")
+    parser.add_argument("--w-overlap", type=float, default=1.25, help="Redundant overlap penalty weight")
+    parser.add_argument("--w-col", type=float, default=6.0, help="Collision penalty weight")
+    parser.add_argument("--indiv-weight", type=float, default=0.25, help="Individual Voronoi reward weight")
+    parser.add_argument("--sensor-dropout", type=float, default=0.0, help="Sensor dropout probability")
+    parser.add_argument("--ou-weight", type=float, default=0.20, help="OU drift blending weight for train targets")
     args = parser.parse_args()
 
     train_mappo_rgbt(
@@ -324,5 +450,11 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         resume=args.resume,
         lr=args.lr,
-        seed=args.seed
+        seed=args.seed,
+        exp_name=args.exp_name,
+        w_overlap=args.w_overlap,
+        w_col=args.w_col,
+        indiv_weight=args.indiv_weight,
+        sensor_dropout=args.sensor_dropout,
+        ou_weight=args.ou_weight,
     )

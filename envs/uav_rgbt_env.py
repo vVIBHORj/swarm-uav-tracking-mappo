@@ -35,7 +35,8 @@ class UAVRGBTTrackingEnv(ParallelEnv):
         w_smooth=0.02,
         indiv_weight=0.25,
         sensor_dropout_prob=0.0,
-        ou_weight=0.20
+        ou_weight=0.20,
+        sensor_dropout=None
     ):
         super().__init__()
         self.num_drones = num_drones
@@ -54,7 +55,8 @@ class UAVRGBTTrackingEnv(ParallelEnv):
         self.w_prox = float(w_prox)
         self.w_smooth = float(w_smooth)
         self.indiv_weight = float(indiv_weight)
-        self.sensor_dropout_prob = float(sensor_dropout_prob)
+        effective_dropout = sensor_dropout if sensor_dropout is not None else sensor_dropout_prob
+        self.sensor_dropout_prob = float(effective_dropout)
         self.ou_weight = float(ou_weight)
 
         # Physical Arena & Kinematics Constants (in sim_units)
