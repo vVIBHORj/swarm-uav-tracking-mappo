@@ -38,7 +38,7 @@
 15. [Hyperparameters](#-hyperparameters)
 16. [Limitations & Future Work](#-limitations--future-work)
 17. [Citation & Acknowledgements](#-citation--acknowledgements)
-18. [License](#-license)
+
 
 ---
 
@@ -664,7 +664,7 @@ Solid lines are drone tracks and dash-dot lines are target tracks (circles mark 
 ### 1. Clone & Install
 
 ```bash
-git clone https://github.com/<your-username>/Anti-UAV-RGBT-Swarm.git
+git clone https://github.com/vVIBHORj/swarm-uav-tracking-mappo.git
 cd Anti-UAV-RGBT-Swarm
 
 # Install dependencies
