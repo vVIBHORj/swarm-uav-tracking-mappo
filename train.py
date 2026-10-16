@@ -392,27 +392,33 @@ def train_mappo_rgbt(
     )
     print(f"[SAVED] Complete training history arrays saved to {history_file} ({len(history_steps)} records)")
 
-    # Generate and Save 3-Panel Publication-Quality Figure
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4.5), dpi=200)
+    # Generate and Save 4-Panel Publication-Quality Figure
+    fig, axes = plt.subplots(1, 4, figsize=(21, 4.5), dpi=200)
 
     axes[0].plot(history_steps, history_rew, color="#2563eb", lw=1.8)
-    axes[0].set_title("Team / Agent Mean Reward", fontsize=12, fontweight="bold")
+    axes[0].set_title("Team / Agent Mean Reward", fontsize=11, fontweight="bold")
     axes[0].set_xlabel("Timesteps", fontsize=10)
     axes[0].set_ylabel("Reward", fontsize=10)
     axes[0].grid(True, linestyle="--", alpha=0.5)
 
     axes[1].plot(history_steps, history_tcr, color="#16a34a", lw=1.8)
-    axes[1].set_title("Target Coverage Ratio (%)", fontsize=12, fontweight="bold")
+    axes[1].set_title("Target Coverage Ratio (TCR %)", fontsize=11, fontweight="bold")
     axes[1].set_xlabel("Timesteps", fontsize=10)
     axes[1].set_ylabel("Coverage (%)", fontsize=10)
     axes[1].grid(True, linestyle="--", alpha=0.5)
 
-    axes[2].plot(history_steps, history_overlap, color="#eab308", lw=1.8, label="Redundant Overlaps")
-    axes[2].plot(history_steps, history_col, color="#dc2626", lw=1.8, label="Collisions / Step")
-    axes[2].set_title("Overlaps & Collisions / Step", fontsize=12, fontweight="bold")
+    axes[2].plot(history_steps, history_ate, color="#8b5cf6", lw=1.8)
+    axes[2].set_title("Average Tracking Error (ATE)", fontsize=11, fontweight="bold")
     axes[2].set_xlabel("Timesteps", fontsize=10)
-    axes[2].legend(loc="upper right", frameon=True)
+    axes[2].set_ylabel("ATE (sim_units)", fontsize=10)
     axes[2].grid(True, linestyle="--", alpha=0.5)
+
+    axes[3].plot(history_steps, history_overlap, color="#eab308", lw=1.8, label="Redundant Overlaps")
+    axes[3].plot(history_steps, history_col, color="#dc2626", lw=1.8, label="Collisions / Step")
+    axes[3].set_title("Overlaps & Collisions / Step", fontsize=11, fontweight="bold")
+    axes[3].set_xlabel("Timesteps", fontsize=10)
+    axes[3].legend(loc="upper right", frameon=True)
+    axes[3].grid(True, linestyle="--", alpha=0.5)
 
     plt.tight_layout()
     curve_path = f"results/training_curves_{exp_name}.png" if exp_name != "default" else "results/training_curves.png"

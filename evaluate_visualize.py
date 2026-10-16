@@ -690,20 +690,174 @@ def evaluate_test_split(checkpoint_path="checkpoints/mappo_actor_best.pt", episo
         print(f"[SAVED] Animated test episode saved to {gif_path}")
 
 
+def run_ablations_eval(episodes=30):
+    """Evaluates all 6 controlled ablation variants on the held-out test split."""
+    ablation_specs = [
+        ("ablate_full", "Full Model", "checkpoints/ablate_full_actor_best.pt"),
+        ("ablate_no_overlap", "No Overlap Penalty", "checkpoints/ablate_no_overlap_actor_best.pt"),
+        ("ablate_no_indiv", "No Individual Reward", "checkpoints/ablate_no_indiv_actor_best.pt"),
+        ("ablate_no_col", "No Collision Penalty", "checkpoints/ablate_no_col_actor_best.pt"),
+        ("ablate_high_dropout", "25% Sensor Dropout", "checkpoints/ablate_high_dropout_actor_best.pt"),
+        ("ablate_no_ou", "Pure Dataset Motion", "checkpoints/ablate_no_ou_actor_best.pt"),
+    ]
+
+    env = UAVRGBTTrackingEnv(num_drones=3, num_targets=4, split="test", render_mode=None)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    results = {}
+    print("\n" + "=" * 80)
+    print(f"   CONTROLLED ABLATION STUDY EVALUATION ({episodes} SEEDED TEST EPISODES)")
+    print("=" * 80)
+
+    for key, name, ckpt in ablation_specs:
+        if not os.path.exists(ckpt):
+            fallback = ckpt.replace("_best.pt", "_latest.pt")
+            if os.path.exists(fallback):
+                ckpt = fallback
+            else:
+                print(f"[WARNING] Checkpoint {ckpt} not found! Skipping {name}.")
+                continue
+
+        print(f"\n[EVAL] Evaluating {name} ({ckpt})...")
+        actor = SharedActor(obs_dim=env.obs_dim, act_dim=2).to(device)
+        actor.load_state_dict(torch.load(ckpt, map_location=device, weights_only=True))
+        actor.eval()
+
+        def make_eval_policy(act_net):
+            def _pol(obs_dict, env=None, rng=None):
+                obs_arr = np.stack([obs_dict[a] for a in env.agents]).astype(np.float32)
+                obs_t = torch.tensor(obs_arr, dtype=torch.float32, device=device)
+                with torch.no_grad():
+                    act_t, _, _ = act_net.get_action_and_logprob(obs_t, deterministic=True, update_norm=False)
+                act_np = act_t.cpu().numpy()
+                return {a: act_np[i] for i, a in enumerate(env.agents)}
+            return _pol
+
+        metrics = run_policy_evaluation(env, make_eval_policy(actor), episodes=episodes)
+        results[key] = {
+            "name": name,
+            "checkpoint": ckpt,
+            "metrics": metrics
+        }
+
+    env.close()
+
+    # Save ablation metrics JSON
+    os.makedirs("results", exist_ok=True)
+    json_path = "results/ablation_study_metrics.json"
+    with open(json_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\n[SAVED] Ablation JSON metrics saved to {json_path}")
+
+    # Save ablation metrics CSV
+    csv_path = "results/ablation_study_metrics.csv"
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "Ablation_Variant", "Display_Name",
+            "TCR_Mean_Pct", "TCR_Std_Pct",
+            "ATE_Mean_sim_units", "ATE_Std_sim_units",
+            "Overlap_Mean", "Overlap_Std",
+            "Collisions_Mean_per_ep", "Collisions_Std_per_ep",
+            "Total_Collisions"
+        ])
+        for k, item in results.items():
+            m = item["metrics"]
+            writer.writerow([
+                k, item["name"],
+                f"{m['mean_tcr']*100:.2f}", f"{m['std_tcr']*100:.2f}",
+                f"{m['mean_ate']:.2f}", f"{m['std_ate']:.2f}",
+                f"{m['mean_overlap']:.3f}", f"{m['std_overlap']:.3f}",
+                f"{m['mean_collisions_per_ep']:.2f}", f"{m['std_collisions_per_ep']:.2f}",
+                m["total_collisions"]
+            ])
+    print(f"[SAVED] Tabular ablation CSV saved to {csv_path}")
+
+    # Formatted Ablation Table
+    print("\n" + "=" * 95)
+    print(f"{'Variant':<26} | {'TCR (%)':<16} | {'ATE (sim_units)':<18} | {'Overlap/step':<14} | {'Collisions/ep':<14}")
+    print("-" * 95)
+    for k, item in results.items():
+        m = item["metrics"]
+        tcr_str = f"{m['mean_tcr']*100:.1f} +/- {m['std_tcr']*100:.1f}%"
+        ate_str = f"{m['mean_ate']:.1f} +/- {m['std_ate']:.1f}"
+        ov_str = f"{m['mean_overlap']:.2f} +/- {m['std_overlap']:.2f}"
+        col_str = f"{m['mean_collisions_per_ep']:.2f} +/- {m['std_collisions_per_ep']:.2f}"
+        print(f"{item['name']:<26} | {tcr_str:<16} | {ate_str:<18} | {ov_str:<14} | {col_str:<14}")
+    print("=" * 95)
+
+    # 4-Panel Publication-Quality Ablation Bar Chart
+    if results:
+        names = [item["name"] for item in results.values()]
+        tcrs = [item["metrics"]["mean_tcr"] * 100.0 for item in results.values()]
+        tcr_stds = [item["metrics"]["std_tcr"] * 100.0 for item in results.values()]
+        ates = [item["metrics"]["mean_ate"] for item in results.values()]
+        ate_stds = [item["metrics"]["std_ate"] for item in results.values()]
+        overlaps = [item["metrics"]["mean_overlap"] for item in results.values()]
+        overlap_stds = [item["metrics"]["std_overlap"] for item in results.values()]
+        cols = [item["metrics"]["mean_collisions_per_ep"] for item in results.values()]
+        col_stds = [item["metrics"]["std_collisions_per_ep"] for item in results.values()]
+
+        fig, axes = plt.subplots(1, 4, figsize=(22, 5.0), dpi=200)
+        colors = ["#10b981", "#f59e0b", "#3b82f6", "#ef4444", "#8b5cf6", "#64748b"][:len(names)]
+
+        # 1. TCR
+        b1 = axes[0].bar(names, tcrs, yerr=tcr_stds, capsize=4, color=colors, edgecolor="#0f172a", lw=1.2)
+        axes[0].set_title("Target Coverage Ratio (TCR %)", fontsize=11, fontweight="bold")
+        axes[0].set_ylabel("Coverage (%)", fontsize=10)
+        axes[0].set_ylim(0, 100)
+        axes[0].tick_params(axis="x", rotation=30)
+        axes[0].grid(True, linestyle="--", alpha=0.5, axis="y")
+
+        # 2. ATE
+        b2 = axes[1].bar(names, ates, yerr=ate_stds, capsize=4, color=colors, edgecolor="#0f172a", lw=1.2)
+        axes[1].set_title("Tracking Error (ATE sim_units)", fontsize=11, fontweight="bold")
+        axes[1].set_ylabel("ATE (sim_units)", fontsize=10)
+        axes[1].tick_params(axis="x", rotation=30)
+        axes[1].grid(True, linestyle="--", alpha=0.5, axis="y")
+
+        # 3. Overlap
+        b3 = axes[2].bar(names, overlaps, yerr=overlap_stds, capsize=4, color=colors, edgecolor="#0f172a", lw=1.2)
+        axes[2].set_title("Redundant Overlaps / Step", fontsize=11, fontweight="bold")
+        axes[2].set_ylabel("Overlaps / Step", fontsize=10)
+        axes[2].tick_params(axis="x", rotation=30)
+        axes[2].grid(True, linestyle="--", alpha=0.5, axis="y")
+
+        # 4. Collisions
+        b4 = axes[3].bar(names, cols, yerr=col_stds, capsize=4, color=colors, edgecolor="#0f172a", lw=1.2)
+        axes[3].set_title("Inter-Drone Collisions / Ep", fontsize=11, fontweight="bold")
+        axes[3].set_ylabel("Collisions / Ep", fontsize=10)
+        axes[3].tick_params(axis="x", rotation=30)
+        axes[3].grid(True, linestyle="--", alpha=0.5, axis="y")
+
+        plt.suptitle("Controlled One-Factor Ablation Study on Held-Out Anti-UAV-RGBT Test Set", fontsize=13, fontweight="bold", y=1.03)
+        plt.tight_layout()
+        chart_path = "results/ablation_comparison.png"
+        plt.savefig(chart_path, dpi=200, bbox_inches="tight")
+        plt.close()
+        print(f"[SAVED] Ablation comparison figure saved to {chart_path}")
+
+    return results
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate & Benchmark MAPPO Swarm on Anti-UAV-RGBT")
     parser.add_argument("--checkpoint", type=str, default="checkpoints/mappo_actor_best.pt", help="Path to actor checkpoint")
     parser.add_argument("--checkpoints", nargs="*", default=None, help="Optional multiple actor checkpoints for cross-seed benchmark")
     parser.add_argument("--episodes", type=int, default=30, help="Number of test episodes")
     parser.add_argument("--compare-baselines", action="store_true", help="Run full 5-policy baseline comparison suite")
+    parser.add_argument("--run-ablations-eval", action="store_true", help="Run comprehensive ablation study evaluation suite")
     parser.add_argument("--render", action="store_true", help="Launch live Pygame visualizer")
     parser.add_argument("--save-gif", action="store_true", help="Record and save episode preview GIF/PNG")
     args = parser.parse_args()
 
     ckpts = args.checkpoints if args.checkpoints else [args.checkpoint]
 
-    if args.compare_baselines:
+    if args.run_ablations_eval:
+        run_ablations_eval(episodes=args.episodes)
+    elif args.compare_baselines:
         compare_all_baselines(checkpoint_paths=ckpts, episodes=args.episodes)
     else:
         num_eps = args.episodes if not args.render else (args.episodes if args.episodes != 30 else 5)
         evaluate_test_split(checkpoint_path=args.checkpoint, episodes=num_eps, render=args.render, save_gif=args.save_gif)
+
