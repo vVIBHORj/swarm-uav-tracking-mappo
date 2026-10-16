@@ -67,8 +67,8 @@ In modern counter-UAV and surveillance operations, small aerial targets move eva
 This project derives target kinematic profiles from the official **Anti-UAV-RGBT (Anti-UAV300)** dataset:
 - **Synchronized Modalities:** Visible-spectrum RGB (`1920x1080` resolution) and Thermal Infrared (`640x512` resolution) with frame-by-frame bounding boxes `[x, y, w, h]` and target existence flags (`exist \in {0, 1}`).
 - **Sequence Hygiene:** Strict disjoint splitting into **159 training sequences**, **66 validation sequences**, and **91 held-out test sequences** (`316` sequences total).
-- **Scale-Adjusted Velocity Extraction:** Frame-to-frame image-plane displacements are normalized by apparent bounding box scale ($s_t = \sqrt{w_t h_t}$) with camera-panning jump rejection ($> 50.0$ threshold) and exponential moving average (EMA) smoothing:
-  $$\hat{\mathbf{v}}_t = \frac{\mathbf{c}_t - \mathbf{c}_{t-1}}{\max(s_t, 1.0)} \cdot s_0$$
+- **Scale-Adjusted Velocity Extraction:** Frame-to-frame image-plane displacements are normalized by apparent bounding box scale ($s_t = \max(\sqrt{(w_t/W)(h_t/H)}, 0.015)$) with camera-panning jump rejection ($> 0.08$ normalized screen displacement in a single frame, rejecting slew artifacts) and exponential moving average (EMA, $\alpha = 0.30$) smoothing:
+  $$\hat{\mathbf{v}}_t = \text{clip}\left(\frac{\text{EMA}(\Delta \mathbf{c}_t / s_t)}{\sigma} \cdot 0.55 v_{\max}, -v_{\max}, v_{\max}\right)$$
 - **Dual-Sensor Visibility Mask:** Target signals are tagged frame-by-frame with binary optical (`rgb_vis`) and thermal (`ir_vis`) availability flags, along with official challenge attributes (`label_new/`): Fast Motion (`FM`), Low Illumination (`LI`), Long-Range (`LR`), Occlusion (`OC`), Out-of-View (`OV`), Scale Variation (`SV`), Thermal Crossover (`TC`).
 
 ### ⚠️ Coordinate Units Disclaimer (AUD-08)
@@ -263,7 +263,8 @@ The trained MAPPO swarm was evaluated against 4 observation-only baselines on 30
 | **Greedy Nearest-Target** | 72.1% ± 14.6% | 15.5 ± 6.1 | 2.31 ± 1.31 | 162.73 ± 115.63 *(Severe)* |
 | **Collision-Aware Greedy** | 75.5% ± 12.9% | 13.6 ± 5.6 | 2.21 ± 1.31 | 4.07 ± 4.77 |
 | **Bipartite Target Assignment** | 85.5% ± 8.4% | 10.3 ± 3.0 | 1.86 ± 1.29 | 0.40 ± 0.84 |
-| **MAPPO Swarm (Ours, 3-Seed)** | **74.0% ± 16.1%** | **19.5 ± 4.0** | **1.06 ± 0.64** *(Lowest)* | **0.73 ± 1.39** *(Safe)* |
+| **MAPPO Swarm (Ours, 300k Primary)** | **79.0% ± 14.5%** | **18.6 ± 3.3** | **0.68 ± 0.55** *(Lowest)* | **0.43 ± 0.99** *(Safe)* |
+| **MAPPO Swarm (3-Seed 100k Ensemble)** | 74.0% ± 16.1% | 19.5 ± 4.0 | 1.06 ± 0.64 | 0.73 ± 1.39 |
 
 ### Challenge Attribute Breakdown (Target Coverage Ratio %)
 
