@@ -355,32 +355,6 @@ pytest -v
 3. **Simulation Units:** Target motion is expressed in dimensionless simulation units (`sim_units`), requiring extrinsic camera calibration before real-world drone deployment.
 4. **Floating-Point Determinism:** Minor cross-architecture floating-point divergence may occur across different GPU CUDA driver versions.
 
-### Prioritized Roadmap:
-- [ ] Implement 3D simulation extension using PyBullet or Isaac Gym.
-- [ ] Incorporate directional Field-of-View (FoV) camera orientation and gimbal pan/tilt actions.
-- [ ] Add real-time visual tracking loop connecting YOLOv8-RGBT directly to observation inputs.
-- [ ] Hardware-in-the-Loop (HIL) deployment on Crazyflie or PX4 quadrotor swarms.
 
 ---
 
-## 📄 License & Attribution
-
-This project is licensed under the MIT License. If you use this work or the Anti-UAV-RGBT benchmark in your research, please cite:
-
-```bibtex
-@article{yu2022surprising,
-  title={The Surprising Effectiveness of PPO in Cooperative Multi-Agent Games},
-  author={Yu, Chao and Velu, Akash and Vinitsky, Eugene and Gao, Jiaxuan and Wang, Yu and Bayen, Alexandre and Wu, Yi},
-  journal={Advances in Neural Information Processing Systems},
-  volume={35},
-  pages={24611--24624},
-  year={2022}
-}
-
-@article{antiuav2021,
-  title={Anti-UAV: A Large-Scale Benchmark for Vision-Based UAV Tracking},
-  author={Jiang, Nan and Wang, Ke and Peng, Xiaoke and Yu, Xuehai and Wang, Qiang and Xiang, Junbiao and Wang, Guodong},
-  journal={IEEE Transactions on Multimedia},
-  year={2021}
-}
-```
