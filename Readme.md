@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🛸 Anti-UAV-RGBT Swarm
+#  Anti-UAV-RGBT Swarm
 ## Dataset-Driven Multi-Agent Reinforcement Learning for Cooperative Target Coverage
 
 **A verified research codebase that extracts scale-adjusted motion and sensor-visibility profiles from the Anti-UAV-RGBT benchmark to train an autonomous three-agent drone swarm ($N = 3$) coordinating coverage of four evasive aerial targets ($M = 4$) via Multi-Agent PPO (MAPPO) with Centralized Training and Decentralized Execution (CTDE).**
